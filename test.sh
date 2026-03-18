@@ -7,7 +7,7 @@ mkdir -p "${THIS_MNT_DIR}"
 mkdir -p "${THIS_CACHE_DIR}"
 
 # set up the manifest
-cat <<EOF > manifest.json
+cat <<EOF > example_manifest.json
 {
   "entries": [
     {
@@ -27,7 +27,7 @@ cat <<EOF > manifest.json
 EOF
 
 # this is blocking
-./urlfs.py manifest.json "${THIS_MNT_DIR}" --cache-dir "${THIS_CACHE_DIR}" --metadata-ttl 600
+./urlfs.py example_manifest.json "${THIS_MNT_DIR}" --cache-dir "${THIS_CACHE_DIR}" --metadata-ttl 600
 
 # so then in another shell, do:
 find "${THIS_MNT_DIR}" -maxdepth 4 -type f | sort
