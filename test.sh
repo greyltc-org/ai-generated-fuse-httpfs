@@ -24,6 +24,24 @@ cat <<EOF > example_manifest.json
       "headers": {
         "Accept": "text/plain"
       }
+    },
+    {
+      "path": "auth_check/expect_pass.json",
+      "url": "https://httpbin.org/basic-auth/user2/passwd",
+      "headers": {
+        "Authorization": "Basic $(echo -n "user2:passwd" | base64)"
+      }
+    },
+    {
+      "path": "auth_check/expect_fail.json",
+      "url": "https://httpbin.org/basic-auth/user2/passwd",
+      "headers": {
+        "Authorization": "Basic dingdong"
+      }
+    },
+    {
+      "path": "auth_check/expect_fail2.json",
+      "url": "https://httpbin.org/basic-auth/user2/passwd"
     }
   ]
 }
@@ -37,6 +55,9 @@ find "${THIS_MNT_DIR}" -maxdepth 4 -type f | sort
 cat "${THIS_MNT_DIR}"/static/robots.txt
 head -c 200 "${THIS_MNT_DIR}"/docs/example.html
 jq .slideshow.slides[0].title "${THIS_MNT_DIR}"/data/sample.json
+jq .authenticated "${THIS_MNT_DIR}"/auth_check/expect_pass.json  # this should return true
+cat "${THIS_MNT_DIR}"/auth_check/expect_fail.json
+cat "${THIS_MNT_DIR}"/auth_check/expect_fail2.json
 find "${THIS_MNT_DIR}" -maxdepth 4 -exec ls -alh {} \;
 tree -hug "${THIS_MNT_DIR}"
 
