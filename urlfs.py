@@ -3,10 +3,10 @@
 import errno
 import hashlib
 import json
-import mimetypes
 import os
 import stat
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -39,6 +39,7 @@ def sha256_text(text: str) -> str:
 class ManifestEntry:
     path: str
     url: str
+    headers: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -86,16 +87,31 @@ class Manifest:
         for item in entries:
             if not isinstance(item, dict):
                 raise ValueError("each manifest entry must be an object")
+
             path = item.get("path")
             url = item.get("url")
+            headers = item.get("headers", {})
+
             if not path or not url:
                 raise ValueError("each entry must include 'path' and 'url'")
+            if not isinstance(headers, dict):
+                raise ValueError(f"headers for {path!r} must be an object")
+
+            normalized_headers: Dict[str, str] = {}
+            for k, v in headers.items():
+                if not isinstance(k, str) or not isinstance(v, str):
+                    raise ValueError(f"headers for {path!r} must be string:string")
+                normalized_headers[k] = v
 
             norm_path = self._normalize_file_path(path)
             if norm_path in self.files:
                 raise ValueError(f"duplicate manifest path: {norm_path}")
 
-            self.files[norm_path] = ManifestEntry(path=norm_path, url=url)
+            self.files[norm_path] = ManifestEntry(
+                path=norm_path,
+                url=url,
+                headers=normalized_headers,
+            )
 
             parts = PurePosixPath(norm_path).parts
             current = "/"
@@ -122,8 +138,8 @@ class Manifest:
             raise KeyError(path)
         return sorted(self.children.get(path, set()))
 
-    def url_for(self, path: str) -> str:
-        return self.files[path].url
+    def entry_for(self, path: str) -> ManifestEntry:
+        return self.files[path]
 
 
 class MetadataCache:
@@ -147,99 +163,124 @@ class MetadataCache:
         return self.cache.get(path)
 
 
-class ContentCache:
+class DiskContentCache:
+    """
+    Stores each file as:
+      <key>.bin   full downloaded content
+      <key>.json  associated metadata
+    """
     def __init__(self, cache_dir: str):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
 
-    def _data_path(self, path: str) -> str:
-        key = sha256_text(path)
-        return os.path.join(self.cache_dir, key + ".bin")
+    def _key(self, path: str) -> str:
+        return sha256_text(path)
 
-    def _meta_path(self, path: str) -> str:
-        key = sha256_text(path)
-        return os.path.join(self.cache_dir, key + ".json")
+    def data_path(self, path: str) -> str:
+        return os.path.join(self.cache_dir, self._key(path) + ".bin")
 
-    def load(self, path: str) -> Tuple[Optional[bytes], Optional[dict]]:
-        data_path = self._data_path(path)
-        meta_path = self._meta_path(path)
-        if not (os.path.exists(data_path) and os.path.exists(meta_path)):
-            return None, None
+    def meta_path(self, path: str) -> str:
+        return os.path.join(self.cache_dir, self._key(path) + ".json")
+
+    def load_meta(self, path: str) -> Optional[dict]:
+        mp = self.meta_path(path)
+        if not os.path.exists(mp):
+            return None
         try:
-            with open(data_path, "rb") as f:
-                data = f.read()
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            return data, meta
+            with open(mp, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
-            return None, None
+            return None
 
-    def save(self, path: str, data: bytes, meta: dict) -> None:
-        data_path = self._data_path(path)
-        meta_path = self._meta_path(path)
-        tmp_data = data_path + ".tmp"
-        tmp_meta = meta_path + ".tmp"
-
-        with open(tmp_data, "wb") as f:
-            f.write(data)
-        with open(tmp_meta, "w", encoding="utf-8") as f:
+    def save_meta(self, path: str, meta: dict) -> None:
+        mp = self.meta_path(path)
+        tmp = mp + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
+        os.replace(tmp, mp)
 
-        os.replace(tmp_data, data_path)
-        os.replace(tmp_meta, meta_path)
+    def has_data(self, path: str) -> bool:
+        return os.path.exists(self.data_path(path))
+
+    def read_slice(self, path: str, offset: int, size: int) -> bytes:
+        dp = self.data_path(path)
+        with open(dp, "rb") as f:
+            f.seek(offset)
+            return f.read(size)
+
+    def begin_stream_write(self, path: str) -> str:
+        dp = self.data_path(path)
+        parent = os.path.dirname(dp)
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(dp) + ".", suffix=".part", dir=parent)
+        os.close(fd)
+        return tmp_path
+
+    def commit_stream_write(self, tmp_path: str, path: str) -> None:
+        os.replace(tmp_path, self.data_path(path))
+
+    def remove_tmp(self, tmp_path: str) -> None:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 class HTTPClient:
-    USER_AGENT = "httpfs-fuse/1.0"
+    USER_AGENT = "httpfs-fuse/2.0"
+
+    def _apply_headers(self, req: Request, headers: Optional[Dict[str, str]]) -> None:
+        req.add_header("User-Agent", self.USER_AGENT)
+        if headers:
+            for k, v in headers.items():
+                req.add_header(k, v)
 
     def _open(self, req: Request, timeout: int = 30):
-        req.add_header("User-Agent", self.USER_AGENT)
         return urlopen(req, timeout=timeout)
 
-    def head(self, url: str) -> HttpMetadata:
+    def head(self, url: str, headers: Optional[Dict[str, str]] = None) -> HttpMetadata:
         req = Request(url, method="HEAD")
-        with self._open(req, timeout=15) as resp:
-            headers = resp.headers
-            size = headers.get("Content-Length")
+        self._apply_headers(req, headers)
+        with self._open(req, timeout=20) as resp:
+            h = resp.headers
+            size = h.get("Content-Length")
             return HttpMetadata(
                 size=int(size) if size and size.isdigit() else None,
-                mtime=parse_http_datetime(headers.get("Last-Modified")),
-                etag=headers.get("ETag"),
-                last_modified=headers.get("Last-Modified"),
-                accept_ranges="bytes" in headers.get("Accept-Ranges", "").lower(),
-                content_type=headers.get_content_type() if hasattr(headers, "get_content_type") else headers.get("Content-Type"),
+                mtime=parse_http_datetime(h.get("Last-Modified")),
+                etag=h.get("ETag"),
+                last_modified=h.get("Last-Modified"),
+                accept_ranges="bytes" in h.get("Accept-Ranges", "").lower(),
+                content_type=h.get_content_type() if hasattr(h, "get_content_type") else h.get("Content-Type"),
             )
 
-    def get_range(self, url: str, offset: int, size: int) -> bytes:
+    def get_range(self, url: str, offset: int, size: int, headers: Optional[Dict[str, str]] = None) -> bytes:
         end = offset + size - 1
         req = Request(url)
+        self._apply_headers(req, headers)
         req.add_header("Range", f"bytes={offset}-{end}")
-        with self._open(req, timeout=30) as resp:
+        with self._open(req, timeout=60) as resp:
             return resp.read()
 
-    def get_full(self, url: str, etag: Optional[str] = None, last_modified: Optional[str] = None):
+    def conditional_get(
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        etag: Optional[str] = None,
+        last_modified: Optional[str] = None,
+    ):
         req = Request(url)
+        self._apply_headers(req, headers)
         if etag:
             req.add_header("If-None-Match", etag)
         if last_modified:
             req.add_header("If-Modified-Since", last_modified)
 
         try:
-            with self._open(req, timeout=60) as resp:
-                headers = resp.headers
-                data = resp.read()
-                meta = HttpMetadata(
-                    size=len(data),
-                    mtime=parse_http_datetime(headers.get("Last-Modified")),
-                    etag=headers.get("ETag"),
-                    last_modified=headers.get("Last-Modified"),
-                    accept_ranges="bytes" in headers.get("Accept-Ranges", "").lower(),
-                    content_type=headers.get_content_type() if hasattr(headers, "get_content_type") else headers.get("Content-Type"),
-                )
-                return 200, data, meta
+            resp = self._open(req, timeout=120)
+            return 200, resp
         except HTTPError as e:
             if e.code == 304:
-                return 304, None, None
+                return 304, None
             raise
 
 
@@ -249,44 +290,52 @@ class HttpManifestFS(Operations):
         manifest_path: str,
         cache_dir: str,
         metadata_ttl: int = 300,
-        dir_mtime: Optional[int] = None,
+        stream_chunk_size: int = 1024 * 1024,
     ):
         self.manifest = Manifest(manifest_path)
         self.metadata_cache = MetadataCache(ttl_seconds=metadata_ttl)
-        self.content_cache = ContentCache(cache_dir=cache_dir)
+        self.content_cache = DiskContentCache(cache_dir=cache_dir)
         self.http = HTTPClient()
         self.fd = 0
         self.dir_mode = stat.S_IFDIR | 0o555
         self.file_mode = stat.S_IFREG | 0o444
-        self.dir_mtime = dir_mtime or utc_now()
+        self.dir_mtime = utc_now()
+        self.stream_chunk_size = max(64 * 1024, int(stream_chunk_size))
 
     def _norm(self, path: str) -> str:
-        p = str(PurePosixPath("/" + path.lstrip("/")))
-        return p
+        return str(PurePosixPath("/" + path.lstrip("/")))
 
     def _assert_exists(self, path: str) -> None:
         if not self.manifest.is_file(path) and not self.manifest.is_dir(path):
             raise FuseOSError(errno.ENOENT)
 
-    def _guess_mtime(self, path: str) -> int:
-        meta = self.metadata_cache.peek(path)
-        if meta and meta.mtime:
-            return meta.mtime
-        return utc_now()
+    def _entry(self, path: str) -> ManifestEntry:
+        return self.manifest.entry_for(path)
+
+    def _metadata_from_cache_meta(self, meta: dict) -> HttpMetadata:
+        return HttpMetadata(
+            size=meta.get("size"),
+            mtime=meta.get("mtime"),
+            etag=meta.get("etag"),
+            last_modified=meta.get("last_modified"),
+            accept_ranges=meta.get("accept_ranges", False),
+            content_type=meta.get("content_type"),
+        )
 
     def _get_metadata(self, path: str) -> HttpMetadata:
         cached = self.metadata_cache.get(path)
         if cached:
             return cached
 
-        url = self.manifest.url_for(path)
+        entry = self._entry(path)
         try:
-            meta = self.http.head(url)
+            meta = self.http.head(entry.url, headers=entry.headers)
         except Exception:
-            old = self.metadata_cache.peek(path)
-            if old:
-                return old
-            meta = HttpMetadata(size=None, mtime=utc_now(), accept_ranges=False)
+            disk_meta = self.content_cache.load_meta(path)
+            if disk_meta:
+                meta = self._metadata_from_cache_meta(disk_meta)
+            else:
+                meta = HttpMetadata(size=None, mtime=utc_now(), accept_ranges=False)
 
         if meta.mtime is None:
             meta.mtime = utc_now()
@@ -294,56 +343,65 @@ class HttpManifestFS(Operations):
         self.metadata_cache.put(path, meta)
         return meta
 
-    def _refresh_full_content_if_needed(self, path: str) -> bytes:
-        url = self.manifest.url_for(path)
-        cached_data, cached_meta = self.content_cache.load(path)
+    def _stream_download_to_cache(self, path: str) -> None:
+        entry = self._entry(path)
+        old_meta = self.content_cache.load_meta(path)
 
-        etag = cached_meta.get("etag") if cached_meta else None
-        last_modified = cached_meta.get("last_modified") if cached_meta else None
+        etag = old_meta.get("etag") if old_meta else None
+        last_modified = old_meta.get("last_modified") if old_meta else None
 
         try:
-            status, data, meta = self.http.get_full(url, etag=etag, last_modified=last_modified)
-            if status == 304 and cached_data is not None and cached_meta is not None:
-                self.metadata_cache.put(
-                    path,
-                    HttpMetadata(
-                        size=cached_meta.get("size"),
-                        mtime=cached_meta.get("mtime"),
-                        etag=cached_meta.get("etag"),
-                        last_modified=cached_meta.get("last_modified"),
-                        accept_ranges=cached_meta.get("accept_ranges", False),
-                        content_type=cached_meta.get("content_type"),
-                    ),
-                )
-                return cached_data
-
-            if status == 200 and data is not None and meta is not None:
-                if meta.mtime is None:
-                    meta.mtime = utc_now()
-
-                self.content_cache.save(
-                    path,
-                    data,
-                    {
-                        "size": meta.size,
-                        "mtime": meta.mtime,
-                        "etag": meta.etag,
-                        "last_modified": meta.last_modified,
-                        "accept_ranges": meta.accept_ranges,
-                        "content_type": meta.content_type,
-                    },
-                )
-                self.metadata_cache.put(path, meta)
-                return data
+            status, resp = self.http.conditional_get(
+                entry.url,
+                headers=entry.headers,
+                etag=etag,
+                last_modified=last_modified,
+            )
         except Exception:
-            if cached_data is not None:
-                return cached_data
+            if self.content_cache.has_data(path):
+                return
             raise FuseOSError(errno.EIO)
 
-        if cached_data is not None:
-            return cached_data
+        if status == 304:
+            if old_meta:
+                self.metadata_cache.put(path, self._metadata_from_cache_meta(old_meta))
+            return
 
-        raise FuseOSError(errno.EIO)
+        if status != 200 or resp is None:
+            if self.content_cache.has_data(path):
+                return
+            raise FuseOSError(errno.EIO)
+
+        tmp_path = self.content_cache.begin_stream_write(path)
+        total = 0
+        try:
+            with resp:
+                h = resp.headers
+                with open(tmp_path, "wb") as out:
+                    while True:
+                        chunk = resp.read(self.stream_chunk_size)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        total += len(chunk)
+
+                meta = {
+                    "size": total,
+                    "mtime": parse_http_datetime(h.get("Last-Modified")) or utc_now(),
+                    "etag": h.get("ETag"),
+                    "last_modified": h.get("Last-Modified"),
+                    "accept_ranges": "bytes" in h.get("Accept-Ranges", "").lower(),
+                    "content_type": h.get_content_type() if hasattr(h, "get_content_type") else h.get("Content-Type"),
+                }
+
+            self.content_cache.commit_stream_write(tmp_path, path)
+            self.content_cache.save_meta(path, meta)
+            self.metadata_cache.put(path, self._metadata_from_cache_meta(meta))
+        except Exception:
+            self.content_cache.remove_tmp(tmp_path)
+            if self.content_cache.has_data(path):
+                return
+            raise FuseOSError(errno.EIO)
 
     def getattr(self, path, fh=None):
         path = self._norm(path)
@@ -395,12 +453,17 @@ class HttpManifestFS(Operations):
         if size <= 0:
             return b""
 
+        entry = self._entry(path)
         meta = self._get_metadata(path)
-        url = self.manifest.url_for(path)
 
         if meta.accept_ranges:
             try:
-                return self.http.get_range(url, offset, size)
+                return self.http.get_range(
+                    entry.url,
+                    offset,
+                    size,
+                    headers=entry.headers,
+                )
             except HTTPError:
                 pass
             except URLError:
@@ -408,19 +471,22 @@ class HttpManifestFS(Operations):
             except Exception:
                 pass
 
-        data = self._refresh_full_content_if_needed(path)
-        return data[offset:offset + size]
+        if not self.content_cache.has_data(path):
+            self._stream_download_to_cache(path)
+
+        disk_meta = self.content_cache.load_meta(path)
+        if disk_meta:
+            current_meta = self._metadata_from_cache_meta(disk_meta)
+            self.metadata_cache.put(path, current_meta)
+
+        return self.content_cache.read_slice(path, offset, size)
 
     def access(self, path, mode):
         path = self._norm(path)
         self._assert_exists(path)
-
         if mode & os.W_OK:
             raise FuseOSError(errno.EROFS)
         return 0
-
-    def readlink(self, path):
-        raise FuseOSError(errno.EINVAL)
 
     def statfs(self, path):
         return {
@@ -485,7 +551,7 @@ def default_cache_dir() -> str:
 
 def usage(argv0: str) -> None:
     print(
-        f"Usage: {argv0} <manifest.json> <mountpoint> [--cache-dir DIR] [--metadata-ttl SECONDS]",
+        f"Usage: {argv0} <manifest.json> <mountpoint> [--cache-dir DIR] [--metadata-ttl SECONDS] [--stream-chunk-size BYTES]",
         file=sys.stderr,
     )
 
@@ -499,34 +565,35 @@ def parse_args(argv):
     mountpoint = argv[2]
     cache_dir = default_cache_dir()
     metadata_ttl = 300
+    stream_chunk_size = 1024 * 1024
 
     i = 3
     while i < len(argv):
         arg = argv[i]
         if arg == "--cache-dir":
             i += 1
-            if i >= len(argv):
-                raise SystemExit("--cache-dir requires a value")
             cache_dir = argv[i]
         elif arg == "--metadata-ttl":
             i += 1
-            if i >= len(argv):
-                raise SystemExit("--metadata-ttl requires a value")
             metadata_ttl = int(argv[i])
+        elif arg == "--stream-chunk-size":
+            i += 1
+            stream_chunk_size = int(argv[i])
         else:
             raise SystemExit(f"unknown argument: {arg}")
         i += 1
 
-    return manifest_path, mountpoint, cache_dir, metadata_ttl
+    return manifest_path, mountpoint, cache_dir, metadata_ttl, stream_chunk_size
 
 
 def main():
-    manifest_path, mountpoint, cache_dir, metadata_ttl = parse_args(sys.argv)
+    manifest_path, mountpoint, cache_dir, metadata_ttl, stream_chunk_size = parse_args(sys.argv)
 
     fs = HttpManifestFS(
         manifest_path=manifest_path,
         cache_dir=cache_dir,
         metadata_ttl=metadata_ttl,
+        stream_chunk_size=stream_chunk_size,
     )
 
     FUSE(
