@@ -328,6 +328,10 @@ class HttpManifestFS(pyfuse3.Operations):
         self.stream_chunk_size = max(64 * 1024, int(stream_chunk_size))
         self._lookup_counts: Dict[int, int] = {}
 
+        # New: per-path download lock table
+        self._download_locks: Dict[str, trio.Lock] = {}
+        self._download_locks_guard = trio.Lock()
+
     def _entry(self, path: str) -> ManifestEntry:
         return self.manifest.entry_for(path)
 
@@ -340,6 +344,14 @@ class HttpManifestFS(pyfuse3.Operations):
             accept_ranges=meta.get("accept_ranges", False),
             content_type=meta.get("content_type"),
         )
+
+    async def _get_download_lock(self, path: str) -> trio.Lock:
+        async with self._download_locks_guard:
+            lock = self._download_locks.get(path)
+            if lock is None:
+                lock = trio.Lock()
+                self._download_locks[path] = lock
+            return lock
 
     async def _get_metadata(self, path: str) -> HttpMetadata:
         cached = self.metadata_cache.get(path)
@@ -431,6 +443,19 @@ class HttpManifestFS(pyfuse3.Operations):
             if self.content_cache.has_data(path):
                 return
             raise pyfuse3.FUSEError(errno.EIO)
+
+    async def _ensure_cached(self, path: str) -> None:
+        # Fast path with no lock.
+        if self.content_cache.has_data(path):
+            return
+
+        lock = await self._get_download_lock(path)
+        async with lock:
+            # Double-check after acquiring the lock.
+            if self.content_cache.has_data(path):
+                return
+
+            await self._stream_download_to_cache(path)
 
     def _entry_attributes(self, inode: int, path: str, meta: Optional[HttpMetadata] = None) -> pyfuse3.EntryAttributes:
         attr = pyfuse3.EntryAttributes()
@@ -533,8 +558,7 @@ class HttpManifestFS(pyfuse3.Operations):
             except Exception:
                 pass
 
-        if not self.content_cache.has_data(path):
-            await self._stream_download_to_cache(path)
+        await self._ensure_cached(path)
 
         disk_meta = self.content_cache.load_meta(path)
         if disk_meta:
