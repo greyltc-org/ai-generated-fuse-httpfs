@@ -30,7 +30,7 @@ cat <<EOF > example_manifest.json
 EOF
 
 # this is blocking
-./urlfs.py example_manifest.json "${THIS_MNT_DIR}" --cache-dir "${THIS_CACHE_DIR}" --metadata-ttl 600
+./urlfs.py example_manifest.json "${THIS_MNT_DIR}" --cache-dir "${THIS_CACHE_DIR}" --metadata-ttl 600 --stream-chunk-size 1048576
 
 # so then in another shell, do:
 find "${THIS_MNT_DIR}" -maxdepth 4 -type f | sort
