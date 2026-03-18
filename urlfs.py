@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import asyncio
 import errno
 import hashlib
 import json
@@ -12,13 +13,14 @@ import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 from pathlib import PurePosixPath
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pyfuse3
-import trio
+import pyfuse3.asyncio
 
+pyfuse3.asyncio.enable()
 
 log = logging.getLogger("httpfs")
 
@@ -328,9 +330,9 @@ class HttpManifestFS(pyfuse3.Operations):
         self.stream_chunk_size = max(64 * 1024, int(stream_chunk_size))
         self._lookup_counts: Dict[int, int] = {}
 
-        # New: per-path download lock table
-        self._download_locks: Dict[str, trio.Lock] = {}
-        self._download_locks_guard = trio.Lock()
+        # Per-path download lock table
+        self._download_locks: Dict[str, asyncio.Lock] = {}
+        self._download_locks_guard = asyncio.Lock()
 
     def _entry(self, path: str) -> ManifestEntry:
         return self.manifest.entry_for(path)
@@ -345,11 +347,11 @@ class HttpManifestFS(pyfuse3.Operations):
             content_type=meta.get("content_type"),
         )
 
-    async def _get_download_lock(self, path: str) -> trio.Lock:
+    async def _get_download_lock(self, path: str) -> asyncio.Lock:
         async with self._download_locks_guard:
             lock = self._download_locks.get(path)
             if lock is None:
-                lock = trio.Lock()
+                lock = asyncio.Lock()
                 self._download_locks[path] = lock
             return lock
 
@@ -364,7 +366,7 @@ class HttpManifestFS(pyfuse3.Operations):
             return self.http.head(entry.url, headers=entry.headers)
 
         try:
-            meta = await trio.to_thread.run_sync(do_head)
+            meta = await asyncio.to_thread(do_head)
         except Exception:
             disk_meta = self.content_cache.load_meta(path)
             if disk_meta:
@@ -393,7 +395,7 @@ class HttpManifestFS(pyfuse3.Operations):
             )
 
         try:
-            status, resp = await trio.to_thread.run_sync(open_response)
+            status, resp = await asyncio.to_thread(open_response)
         except Exception:
             if self.content_cache.has_data(path):
                 return
@@ -434,7 +436,7 @@ class HttpManifestFS(pyfuse3.Operations):
             return meta
 
         try:
-            meta = await trio.to_thread.run_sync(stream_to_disk)
+            meta = await asyncio.to_thread(stream_to_disk)
             self.content_cache.commit_stream_write(tmp_path, path)
             self.content_cache.save_meta(path, meta)
             self.metadata_cache.put(path, self._metadata_from_cache_meta(meta))
@@ -445,16 +447,13 @@ class HttpManifestFS(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EIO)
 
     async def _ensure_cached(self, path: str) -> None:
-        # Fast path with no lock.
         if self.content_cache.has_data(path):
             return
 
         lock = await self._get_download_lock(path)
         async with lock:
-            # Double-check after acquiring the lock.
             if self.content_cache.has_data(path):
                 return
-
             await self._stream_download_to_cache(path)
 
     def _entry_attributes(self, inode: int, path: str, meta: Optional[HttpMetadata] = None) -> pyfuse3.EntryAttributes:
@@ -554,7 +553,7 @@ class HttpManifestFS(pyfuse3.Operations):
                 return self.http.get_range(entry.url, off, size, headers=entry.headers)
 
             try:
-                return await trio.to_thread.run_sync(do_range)
+                return await asyncio.to_thread(do_range)
             except Exception:
                 pass
 
@@ -567,7 +566,7 @@ class HttpManifestFS(pyfuse3.Operations):
         def do_read():
             return self.content_cache.read_slice(path, off, size)
 
-        return await trio.to_thread.run_sync(do_read)
+        return await asyncio.to_thread(do_read)
 
     async def access(self, inode: int, mode: int, ctx) -> bool:
         if mode & os.W_OK:
@@ -656,7 +655,7 @@ async def main():
     )
 
     fuse_options = set(pyfuse3.default_options)
-    fuse_options.add("fsname=http_manifest_pyfuse3")
+    fuse_options.add("fsname=http_manifest_asyncio")
     fuse_options.add("ro")
 
     pyfuse3.init(operations, mountpoint, fuse_options)
@@ -667,4 +666,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    trio.run(main)
+    asyncio.run(main())
