@@ -10,7 +10,10 @@
     },
     {
       "path": "data/sample.json",
-      "url": "https://httpbin.org/json"
+      "url": "https://httpbin.org/json",
+      "headers": {
+        "Accept": "text/plain"
+      }
     }
   ]
 }

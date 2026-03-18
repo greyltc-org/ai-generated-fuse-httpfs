@@ -20,7 +20,10 @@ cat <<EOF > example_manifest.json
     },
     {
       "path": "data/sample.json",
-      "url": "https://httpbin.org/json"
+      "url": "https://httpbin.org/json",
+      "headers": {
+        "Accept": "text/plain"
+      }
     }
   ]
 }
@@ -37,4 +40,5 @@ jq .slideshow.slides[0].title "${THIS_MNT_DIR}"/data/sample.json
 find "${THIS_MNT_DIR}" -maxdepth 4 -exec ls -alh {} \;
 tree -hug "${THIS_MNT_DIR}"
 
+# unmount the fuse fs
 fusermount3 -u "${THIS_MNT_DIR}"
