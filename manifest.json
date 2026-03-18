@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "path": "docs/example.html",
+      "url": "https://kernel.org/"
+    },
+    {
+      "path": "static/robots.txt",
+      "url": "https://www.robotstxt.org/robots.txt"
+    },
+    {
+      "path": "data/sample.json",
+      "url": "https://httpbin.org/json"
+    }
+  ]
+}
