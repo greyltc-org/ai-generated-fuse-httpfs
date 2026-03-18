@@ -14,6 +14,24 @@
       "headers": {
         "Accept": "text/plain"
       }
+    },
+    {
+      "path": "auth_check/expect_pass.json",
+      "url": "https://httpbin.org/basic-auth/user2/passwd",
+      "headers": {
+        "Authorization": "Basic dXNlcjI6cGFzc3dk"
+      }
+    },
+    {
+      "path": "auth_check/expect_fail.json",
+      "url": "https://httpbin.org/basic-auth/user2/passwd",
+      "headers": {
+        "Authorization": "Basic dingdong"
+      }
+    },
+    {
+      "path": "auth_check/expect_fail2.json",
+      "url": "https://httpbin.org/basic-auth/user2/passwd"
     }
   ]
 }
